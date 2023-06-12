@@ -1,62 +1,57 @@
-use std::collections::HashMap;
+#[macro_use] extern crate rocket;
 
-type PlayerId = u64;
 
-#[derive (Default)]
-pub struct GameState {
-    pub players: HashMap<PlayerId, String>,
-    history: Vec<GameEvent>,
+use rocket::{State, Shutdown};
+use rocket::fs::{relative, FileServer};
+use rocket::form::Form;
+use rocket::response::stream::{EventStream, Event};
+use rocket::serde::{Serialize, Deserialize};
+use rocket::tokio::sync::broadcast::{channel, Sender, error::RecvError};
+use rocket::tokio::select;
+
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, UriDisplayQuery))]
+#[serde(crate = "rocket::serde")]
+struct Message {
+    #[field(validate = len(..30))]
+    pub room: String,
+    #[field(validate = len(..20))]
+    pub username: String,
+    pub message: String,
 }
 
-#[derive(Clone)]
-pub enum GameEvent {
-    PlayerJoined {
-        player_id: PlayerId,
-        name: String
-    }
-}
+/// Returns an infinite stream of server-sent events. Each event is a message
+/// pulled from a broadcast queue sent by the `post` handler.
+#[get("/events")]
+async fn events(queue: &State<Sender<Message>>, mut end: Shutdown) -> EventStream![] {
+    let mut rx = queue.subscribe();
+    EventStream! {
+        loop {
+            let msg = select! {
+                msg = rx.recv() => match msg {
+                    Ok(msg) => msg,
+                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Lagged(_)) => continue,
+                },
+                _ = &mut end => break,
+            };
 
-impl GameState {
-    fn reduce(&mut self, valid_event: &GameEvent) {
-        use GameEvent::*;
-        match valid_event {
-            PlayerJoined { player_id, name } => {
-                self.players.insert(*player_id, name.to_string());
-            }
+            yield Event::json(&msg);
         }
-
-        self.history.push(valid_event.clone());
-    }
-    pub fn validate(&self, event: &GameEvent) -> bool {
-        use GameEvent::*;
-
-        match event {
-        PlayerJoined { player_id, name: _ } => {
-            if self.players.contains_key(player_id) {
-                return false;
-            }
-        }
-
-    }
-
-    true
-    }
-
-    pub fn dispatch(&mut self, event: &GameEvent) -> Result<(), ()> {
-        if !self.validate(event) {
-            return Err(());
-        }
-
-        self.reduce(event);
-        Ok(())
     }
 }
 
+/// Receive a message from a form submission and broadcast it to any receivers.
+#[post("/message", data = "<form>")]
+fn post(form: Form<Message>, queue: &State<Sender<Message>>) {
+    // A send 'fails' if there are no active subscribers. That's okay.
+    let _res = queue.send(form.into_inner());
+}
 
-
-fn main() {
-    let mut game_state = GameState::default();
-    let event = GameEvent::PlayerJoined { player_id: 1234, name: "Garry K.".to_string()};
-    game_state.dispatch(&event).unwrap();
-    game_state.dispatch(&event).unwrap();
+#[launch]
+fn rocket() -> _ {
+    rocket::build()
+        .manage(channel::<Message>(1024).0)
+        .mount("/", routes![post, events])
+        .mount("/", FileServer::from(relative!("static")))
 }
